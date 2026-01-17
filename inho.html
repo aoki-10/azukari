@@ -1,0 +1,647 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp, getApps } from 'firebase/app';
+import { 
+  getFirestore, collection, addDoc, onSnapshot, query, 
+  serverTimestamp, updateDoc, doc, deleteDoc, orderBy 
+} from 'firebase/firestore';
+import { 
+  getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  Plus, User, Archive, ChevronLeft, Minus, X, CheckCircle2, Search, CreditCard, Edit3, Calendar, RotateCcw, Trash2, Loader2, AlertTriangle, BellRing, Filter, UserCheck, PackagePlus, RefreshCw
+} from 'lucide-react';
+
+// --- Firebase 設定 ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+const auth = getAuth(app);
+const db = getFirestore(app);
+const COLLECTION_NAME = "residents_v3";
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'ss-azukari-app';
+
+// --- 定数 ---
+const LOCATIONS = [
+  { id: 'office', label: '事務所', color: 'bg-blue-100 text-blue-800 border-blue-200' },
+  { id: 'petty_cash', label: '小口', color: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
+  { id: 'safe', label: '金庫', color: 'bg-amber-100 text-amber-800 border-amber-200' },
+];
+
+const COUNT_ITEMS = ['介護保険証', '介護負担割合証', '介護負担限度額認定証', '後期高齢'];
+const CHECK_ITEMS = ['国民健康保険', '重心', '特定疾病', '身障者手帳', '後期高齢医療限度額認定証', 'マイナンバーカード'];
+const MONEY_TYPES = [10000, 5000, 1000, 500, 100, 50, 10, 5, 1];
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [residents, setResidents] = useState([]);
+  const [view, setView] = useState('current');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // 検索・フィルタ
+  const [searchName, setSearchName] = useState('');
+  const [filterDate, setFilterDate] = useState('');
+  const [deleteStartDate, setDeleteStartDate] = useState('');
+  const [deleteEndDate, setDeleteEndDate] = useState('');
+
+  // フォーム状態
+  const [editingId, setEditingId] = useState(null);
+  const [formStep, setFormStep] = useState(1);
+  const [newOtherItem, setNewOtherItem] = useState('');
+  const [newClinicCard, setNewClinicCard] = useState('');
+  const [formData, setFormData] = useState({
+    name: '', entryDate: '', exitDate: '', 
+    itemCounts: {}, 
+    itemChecks: {},
+    clinicCards: [],
+    otherItems: [],
+    location: '', staffName: '',
+    cashCounts: { 10000: 0, 5000: 0, 1000: 0, 500: 0, 100: 0, 50: 0, 10: 0, 5: 0, 1: 0 },
+    isExited: false,
+  });
+
+  // モーダル・選択管理
+  const [selectedResident, setSelectedResident] = useState(null);
+  const [confirmDeleteTarget, setConfirmDeleteTarget] = useState(null);
+  const [returnStaff, setReturnStaff] = useState('');
+  const [showBatchDeleteModal, setShowBatchDeleteModal] = useState(false);
+  const [dismissNotification, setDismissNotification] = useState(false);
+
+  // --- 認証 (修正版: トークンエラー時のフォールバック追加) ---
+  useEffect(() => {
+    let mounted = true;
+
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          try {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } catch (tokenErr) {
+            // トークンエラー（mismatch等）時は匿名認証に切り替え
+            console.warn("Custom token auth failed, falling back to anonymous:", tokenErr);
+            await signInAnonymously(auth);
+          }
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Critical Auth Error:", err);
+        if (mounted) setError("認証に失敗しました。ページを更新してください。");
+      }
+    };
+
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      if (mounted) {
+        setUser(u);
+        // ユーザーが確定したらローディング状態をデータ取得フェーズに委ねる
+      }
+    });
+
+    return () => { mounted = false; unsubscribe(); };
+  }, []);
+
+  // --- データの同期 ---
+  useEffect(() => {
+    if (!user) return;
+
+    setLoading(true);
+    // RULE 1: Strict Paths
+    const residentsRef = collection(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME);
+    
+    // RULE 2: No Complex Queries (orderByなしで取得し、JS側でソート)
+    const q = query(residentsRef);
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setResidents(data);
+      setLoading(false);
+      setError(null);
+    }, (err) => {
+      console.error("Firestore Error:", err);
+      setError("データの読み込みに失敗しました。権限が不足している可能性があります。");
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // --- ロジック ---
+  const calculateTotalCash = (counts) => {
+    if (!counts) return 0;
+    return MONEY_TYPES.reduce((acc, val) => acc + (val * (counts[val] || 0)), 0);
+  };
+
+  const resetForm = () => {
+    setView('current');
+    setFormStep(1);
+    setEditingId(null);
+    setFormData({
+      name: '', entryDate: '', exitDate: '', itemCounts: {}, itemChecks: {}, clinicCards: [], otherItems: [],
+      location: '', staffName: '',
+      cashCounts: { 10000: 0, 5000: 0, 1000: 0, 500: 0, 100: 0, 50: 0, 10: 0, 5: 0, 1: 0 },
+      isExited: false
+    });
+  };
+
+  const handleSave = async () => {
+    if (!user) return;
+    try {
+      const residentsRef = collection(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME);
+      const payload = { ...formData, updatedAt: serverTimestamp() };
+      if (editingId) {
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, editingId), payload);
+      } else {
+        payload.createdAt = serverTimestamp();
+        await addDoc(residentsRef, payload);
+      }
+      resetForm();
+    } catch (e) {
+      console.error(e);
+      alert("保存に失敗しました。");
+    }
+  };
+
+  const handleBatchDelete = async () => {
+    if (!deleteStartDate || !deleteEndDate) return;
+    const targets = residents.filter(r => 
+      r.isExited && r.exitDate >= deleteStartDate && r.exitDate <= deleteEndDate
+    );
+    if (targets.length === 0) return;
+    try {
+      for (const target of targets) {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, target.id));
+      }
+      setShowBatchDeleteModal(false);
+    } catch (err) {
+      alert("削除中にエラーが発生しました。");
+    }
+  };
+
+  const filteredResidents = residents.filter(r => {
+    const isMatchView = view === 'current' ? !r.isExited : r.isExited;
+    const isMatchSearch = r.name.toLowerCase().includes(searchName.toLowerCase());
+    
+    if (view === 'current') {
+      const isDateMatch = filterDate ? (filterDate >= r.entryDate && filterDate <= r.exitDate) : true;
+      return isMatchView && isMatchSearch && isDateMatch;
+    } else {
+      const isRangeMatch = (deleteStartDate && deleteEndDate) 
+        ? (r.exitDate >= deleteStartDate && r.exitDate <= deleteEndDate) 
+        : true;
+      return isMatchView && isMatchSearch && isRangeMatch;
+    }
+  }).sort((a, b) => {
+    const timeA = a.createdAt?.seconds || 0;
+    const timeB = b.createdAt?.seconds || 0;
+    return timeB - timeA;
+  });
+
+  const todaysExiters = residents.filter(r => !r.isExited && r.exitDate === new Date().toISOString().split('T')[0]);
+
+  // バリデーション
+  const isStep1Valid = formData.name && formData.entryDate && formData.exitDate;
+  const isStep3Valid = formData.location && formData.staffName;
+
+  // エラー画面
+  if (error) return (
+    <div className="flex flex-col items-center justify-center h-screen bg-white p-6 text-center">
+      <div className="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mb-4">
+        <AlertTriangle size={32} />
+      </div>
+      <h2 className="text-lg font-bold text-gray-800 mb-2">接続エラー</h2>
+      <p className="text-sm text-gray-500 mb-6">{error}</p>
+      <button 
+        onClick={() => window.location.reload()} 
+        className="flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-xl font-bold shadow-lg"
+      >
+        <RefreshCw size={18} /> 再読み込み
+      </button>
+    </div>
+  );
+
+  // 読み込み画面
+  if (loading) return (
+    <div className="flex flex-col items-center justify-center h-screen bg-white">
+      <Loader2 className="animate-spin text-blue-500 mb-4" size={40} />
+      <p className="text-gray-400 text-sm font-bold animate-pulse">データを読み込み中...</p>
+    </div>
+  );
+
+  return (
+    <div className="flex justify-center h-screen w-full bg-gray-50 font-sans text-gray-900 overflow-hidden">
+      <div className="w-full max-w-md h-full bg-white relative flex flex-col shadow-lg overflow-hidden">
+        
+        {/* 退居予定通知 */}
+        {!dismissNotification && todaysExiters.length > 0 && view !== 'form' && (
+          <div className="absolute top-2 left-2 right-2 z-50">
+            <div className="bg-orange-500 text-white p-3 rounded-xl shadow-lg flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <BellRing size={16} className="animate-bounce" />
+                <span className="text-xs font-bold">本日退居予定：{todaysExiters.length}名</span>
+              </div>
+              <button onClick={() => setDismissNotification(true)}><X size={16}/></button>
+            </div>
+          </div>
+        )}
+
+        {view === 'form' ? (
+          <div className="flex flex-col h-full">
+            <div className="p-4 flex items-center justify-between border-b bg-white pt-10">
+              <button onClick={() => formStep > 1 ? setFormStep(s => s - 1) : resetForm()} className="text-blue-600 font-bold flex items-center">
+                <ChevronLeft size={20}/> {formStep > 1 ? '戻る' : '中止'}
+              </button>
+              <h2 className="font-bold text-gray-800">{editingId ? '編集' : '新規登録'} ({formStep}/3)</h2>
+              <div className="w-10"></div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-5 pb-32 space-y-6">
+              {formStep === 1 && (
+                <div className="space-y-6 animate-in slide-in-from-right duration-200">
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-gray-400 ml-1">利用者氏名 (必須)</label>
+                    <input type="text" className="w-full p-4 bg-gray-100 rounded-xl font-bold outline-none border-2 border-transparent focus:border-blue-500" placeholder="氏名を入力" value={formData.name} onChange={e => setFormData({...formData, name: e.target.value})} />
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-gray-400 ml-1">入居日 (必須)</label>
+                      <input type="date" className="w-full p-4 bg-gray-100 rounded-xl font-bold" value={formData.entryDate} onChange={e => setFormData({...formData, entryDate: e.target.value})} />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-xs font-bold text-gray-400 ml-1">退居予定日 (必須)</label>
+                      <input type="date" className="w-full p-4 bg-gray-100 rounded-xl font-bold" value={formData.exitDate} onChange={e => setFormData({...formData, exitDate: e.target.value})} />
+                    </div>
+                  </div>
+                  <button onClick={() => isStep1Valid && setFormStep(2)} disabled={!isStep1Valid} className={`w-full py-4 rounded-xl font-bold transition-all ${isStep1Valid ? 'bg-blue-600 text-white shadow-md' : 'bg-gray-200 text-gray-400'}`}>次へ進む</button>
+                </div>
+              )}
+
+              {formStep === 2 && (
+                <div className="space-y-6 animate-in slide-in-from-right duration-200">
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-800 mb-3 border-l-4 border-blue-600 pl-2">保険証・認定証（枚数）</h3>
+                    <div className="space-y-2">
+                      {COUNT_ITEMS.map(item => (
+                        <div key={item} className="flex justify-between items-center bg-gray-50 p-3 rounded-xl border border-gray-100">
+                          <span className="font-bold text-sm text-gray-600">{item}</span>
+                          <div className="flex items-center gap-3">
+                            <button onClick={() => setFormData({...formData, itemCounts: {...formData.itemCounts, [item]: Math.max(0, (formData.itemCounts?.[item] || 0) - 1)}})} className="w-8 h-8 rounded-full bg-white flex items-center justify-center border shadow-sm text-gray-400"><Minus size={14}/></button>
+                            <span className="font-bold w-4 text-center">{formData.itemCounts?.[item] || 0}</span>
+                            <button onClick={() => setFormData({...formData, itemCounts: {...formData.itemCounts, [item]: (formData.itemCounts?.[item] || 0) + 1}})} className="w-8 h-8 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-sm"><Plus size={14}/></button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-800 mb-3 border-l-4 border-blue-600 pl-2">その他の証書（チェック）</h3>
+                    <div className="grid grid-cols-2 gap-2">
+                      {CHECK_ITEMS.map(item => (
+                        <label key={item} className={`flex items-center gap-2 p-3 rounded-xl border-2 transition-all cursor-pointer ${formData.itemChecks?.[item] ? 'border-blue-500 bg-blue-50' : 'border-transparent bg-gray-50'}`}>
+                          <input type="checkbox" className="w-4 h-4 accent-blue-600" checked={!!formData.itemChecks?.[item]} onChange={e => setFormData({...formData, itemChecks: {...formData.itemChecks, [item]: e.target.checked}})} />
+                          <span className="text-[11px] font-bold text-gray-600">{item}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-800 mb-3 border-l-4 border-blue-600 pl-2">診察券の登録</h3>
+                    <div className="bg-gray-50 p-3 rounded-xl space-y-2 border border-gray-100">
+                      <div className="flex gap-2">
+                        <input type="text" className="flex-1 p-2.5 bg-white rounded-lg text-xs font-bold border outline-none" placeholder="病院名を追加" value={newClinicCard} onChange={e => setNewClinicCard(e.target.value)} />
+                        <button onClick={() => { if (!newClinicCard) return; setFormData(p => ({...p, clinicCards: [...(p.clinicCards || []), newClinicCard]})); setNewClinicCard(''); }} className="px-3 bg-blue-600 text-white rounded-lg"><Plus size={18}/></button>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {formData.clinicCards?.map((card, i) => (
+                          <span key={i} className="bg-white border border-blue-200 text-blue-700 px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1">
+                            {card} <button onClick={() => setFormData(p => ({...p, clinicCards: p.clinicCards.filter((_, idx) => idx !== i)}))}><X size={10}/></button>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-800 mb-3 border-l-4 border-blue-600 pl-2">現金管理</h3>
+                    <div className="bg-gray-900 text-white p-4 rounded-2xl space-y-4 shadow-xl">
+                      <div className="flex justify-between items-center border-b border-white/10 pb-2">
+                        <span className="text-[10px] font-bold opacity-60">合計額</span>
+                        <p className="text-xl font-bold text-blue-400">¥{calculateTotalCash(formData.cashCounts).toLocaleString()}</p>
+                      </div>
+                      <div className="grid grid-cols-3 gap-x-2 gap-y-3">
+                        {MONEY_TYPES.map(m => (
+                          <div key={m} className="bg-white/5 p-2 rounded-lg text-center border border-white/5">
+                            <span className="text-[8px] font-bold opacity-50 block mb-1">{m.toLocaleString()}円</span>
+                            <input type="number" className="bg-transparent w-full font-bold text-center text-sm outline-none" placeholder="0" value={formData.cashCounts?.[m] || ''} onChange={e => setFormData({...formData, cashCounts: {...formData.cashCounts, [m]: Math.max(0, parseInt(e.target.value) || 0)}})} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <h3 className="text-sm font-bold text-gray-800 mb-3 border-l-4 border-blue-600 pl-2">その他</h3>
+                    <div className="bg-gray-50 p-3 rounded-xl space-y-2 border border-gray-100">
+                      <div className="flex gap-2">
+                        <input type="text" className="flex-1 p-2.5 bg-white rounded-lg text-xs font-bold border outline-none" placeholder="物品名を入力" value={newOtherItem} onChange={e => setNewOtherItem(e.target.value)} />
+                        <button onClick={() => { if (!newOtherItem) return; setFormData(p => ({...p, otherItems: [...(p.otherItems || []), newOtherItem]})); setNewOtherItem(''); }} className="px-3 bg-gray-800 text-white rounded-lg"><Plus size={18}/></button>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {formData.otherItems?.map((item, i) => (
+                          <span key={i} className="bg-white border text-gray-700 px-2 py-1 rounded-md text-[10px] font-bold flex items-center gap-1">
+                            {item} <button onClick={() => setFormData(p => ({...p, otherItems: p.otherItems.filter((_, idx) => idx !== i)}))}><X size={10}/></button>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  
+                  <button onClick={() => setFormStep(3)} className="w-full py-4 rounded-xl bg-blue-600 text-white font-bold shadow-md">次へ進む</button>
+                </div>
+              )}
+
+              {formStep === 3 && (
+                <div className="space-y-6 animate-in slide-in-from-right duration-200">
+                  <div className="space-y-4">
+                    <label className="text-xs font-bold text-gray-400 ml-1">保管場所 (必須)</label>
+                    <div className="grid gap-2">
+                      {LOCATIONS.map(l => (
+                        <label key={l.id} className={`flex items-center justify-between p-4 rounded-xl border-2 transition-all cursor-pointer ${formData.location === l.id ? 'border-blue-600 bg-blue-50 shadow-sm' : 'border-transparent bg-gray-50'}`}>
+                          <span className={`font-bold ${formData.location === l.id ? 'text-blue-700' : 'text-gray-600'}`}>{l.label}</span>
+                          <input type="radio" className="hidden" checked={formData.location === l.id} onChange={() => setFormData({...formData, location: l.id})} />
+                          {formData.location === l.id && <CheckCircle2 className="text-blue-600" size={20}/>}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-xs font-bold text-gray-400 ml-1">預かった職員 (必須)</label>
+                    <input type="text" className="w-full p-4 bg-gray-100 rounded-xl font-bold outline-none border-2 border-transparent focus:border-blue-500" placeholder="職員名を入力" value={formData.staffName} onChange={e => setFormData({...formData, staffName: e.target.value})} />
+                  </div>
+                  <button onClick={handleSave} disabled={!isStep3Valid} className={`w-full py-4 rounded-xl font-bold shadow-md transition-all ${isStep3Valid ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-400'}`}>
+                    {editingId ? '変更を保存する' : '登録を完了する'}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          /* メイン画面 */
+          <div className="flex flex-col h-full">
+            <div className="p-4 pt-12 space-y-4 bg-white shadow-sm z-10 shrink-0">
+              <div className="flex justify-between items-center">
+                <h1 className="text-2xl font-black tracking-tight text-gray-900">預かり管理</h1>
+                <button onClick={() => setView('form')} className="w-11 h-11 bg-blue-600 text-white rounded-2xl flex items-center justify-center shadow-lg active:scale-95 transition-all">
+                  <Plus size={26} />
+                </button>
+              </div>
+
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"/>
+                  <input type="text" className="w-full bg-gray-100 pl-10 pr-4 py-3.5 rounded-2xl text-[13px] font-bold outline-none border-2 border-transparent focus:bg-white focus:border-blue-500/10 transition-all" placeholder="氏名で検索..." value={searchName} onChange={e => setSearchName(e.target.value)} />
+                </div>
+                {view === 'current' && (
+                  <div className="relative">
+                    <Calendar size={18} className={`absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none z-10 ${filterDate ? 'text-blue-600' : 'text-gray-400'}`}/>
+                    <input type="date" className={`pl-10 pr-4 py-3.5 rounded-2xl text-xs font-bold transition-all outline-none border-2 border-transparent ${filterDate ? 'bg-blue-50 border-blue-100 w-36' : 'bg-gray-100 w-12 text-transparent'}`} value={filterDate} onChange={e => setFilterDate(e.target.value)} />
+                    {filterDate && <button onClick={() => setFilterDate('')} className="absolute -top-1 -right-1 bg-gray-800 text-white w-5 h-5 rounded-full flex items-center justify-center border-2 border-white shadow-md"><X size={10}/></button>}
+                  </div>
+                )}
+                {view === 'exited' && (
+                  <button onClick={() => setShowBatchDeleteModal(true)} className="px-4 bg-gray-100 rounded-2xl text-gray-500 hover:bg-gray-200 transition-colors"><Filter size={18}/></button>
+                )}
+              </div>
+            </div>
+
+            {/* 一覧 */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 pb-24">
+              {filteredResidents.map(r => {
+                const loc = LOCATIONS.find(l => l.id === r.location);
+                return (
+                  <div key={r.id} onClick={() => setSelectedResident(r)} className="bg-white rounded-2xl p-5 border border-gray-100 shadow-sm active:scale-[0.98] transition-all cursor-pointer">
+                    <div className="flex justify-between items-start mb-3">
+                      <div>
+                        <h3 className="text-lg font-bold text-gray-800">{r.name} <span className="text-[10px] text-gray-400 font-normal ml-1">様</span></h3>
+                        <div className="flex items-center gap-1.5 mt-1">
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-md border ${loc?.color}`}>
+                            {loc?.label}
+                          </span>
+                          <p className="text-[10px] text-gray-400 font-medium">{r.entryDate} 〜 {r.exitDate}</p>
+                        </div>
+                      </div>
+                      {calculateTotalCash(r.cashCounts) > 0 && (
+                        <div className="text-right">
+                          <p className="text-sm font-black text-blue-600">¥{calculateTotalCash(r.cashCounts).toLocaleString()}</p>
+                          <p className="text-[8px] text-gray-300 font-bold uppercase tracking-widest">Azukari-kin</p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap gap-1.5">
+                      {Object.entries(r.itemCounts || {}).map(([k, v]) => v > 0 && (
+                        <span key={k} className="bg-blue-50 text-blue-700 px-2 py-0.5 rounded-lg text-[10px] font-bold border border-blue-100">{k}: {v}</span>
+                      ))}
+                      {Object.entries(r.itemChecks || {}).map(([k, v]) => v && (
+                        <span key={k} className="bg-gray-50 text-gray-500 px-2 py-0.5 rounded-lg text-[10px] font-bold border border-gray-200">{k}</span>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+              {filteredResidents.length === 0 && (
+                <div className="py-20 text-center space-y-2 opacity-30">
+                  <Archive size={48} className="mx-auto" />
+                  <p className="font-bold text-sm">データがありません</p>
+                </div>
+              )}
+            </div>
+            
+            {/* ナビゲーション */}
+            <div className="shrink-0 h-24 bg-white/80 backdrop-blur-md border-t flex justify-around items-center px-10 pb-6">
+              <button onClick={() => setView('current')} className={`flex flex-col items-center gap-1.5 transition-all ${view === 'current' ? 'text-blue-600 scale-110' : 'text-gray-300'}`}>
+                <User size={24} strokeWidth={view === 'current' ? 3 : 2} />
+                <span className="text-[11px] font-black">利用中</span>
+              </button>
+              <button onClick={() => setView('exited')} className={`flex flex-col items-center gap-1.5 transition-all ${view === 'exited' ? 'text-blue-600 scale-110' : 'text-gray-300'}`}>
+                <Archive size={24} strokeWidth={view === 'exited' ? 3 : 2} />
+                <span className="text-[11px] font-black">退居済み</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* --- 詳細・返却モーダル --- */}
+        {selectedResident && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-end justify-center">
+            <div className="bg-white w-full max-w-md rounded-t-[40px] p-8 pb-12 shadow-2xl animate-in slide-in-from-bottom duration-300 max-h-[92vh] overflow-y-auto border-t">
+              <div className="w-12 h-1.5 bg-gray-200 rounded-full mx-auto mb-8"></div>
+              
+              <div className="flex justify-between items-start mb-8">
+                <div>
+                  <h3 className="text-2xl font-black text-gray-900">{selectedResident.name} 様</h3>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className={`px-2 py-0.5 rounded-md text-[9px] font-black border ${selectedResident.isExited ? 'bg-gray-100 text-gray-500' : 'bg-blue-100 text-blue-600 border-blue-200'}`}>
+                      {selectedResident.isExited ? '退居済み' : '入居中'}
+                    </span>
+                    <span className="text-[11px] font-bold text-gray-400">{LOCATIONS.find(l => l.id === selectedResident.location)?.label} 保管</span>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  {!selectedResident.isExited && (
+                    <button onClick={() => { setEditingId(selectedResident.id); setFormData({...selectedResident}); setFormStep(1); setView('form'); setSelectedResident(null); }} className="p-2.5 bg-gray-50 rounded-xl text-gray-400 hover:text-blue-600 transition-colors"><Edit3 size={20}/></button>
+                  )}
+                  <button onClick={() => setConfirmDeleteTarget(selectedResident)} className="p-2.5 bg-gray-50 rounded-xl text-gray-400 hover:text-red-500 transition-colors"><Trash2 size={20}/></button>
+                </div>
+              </div>
+
+              {/* 担当者情報 */}
+              <div className="mb-8 grid grid-cols-2 gap-3 text-[11px]">
+                <div className="bg-blue-50/50 p-4 rounded-2xl border border-blue-100/50">
+                  <p className="text-blue-400 font-black mb-1 uppercase tracking-tighter">受付担当</p>
+                  <p className="font-bold text-blue-900 flex items-center gap-1.5"><UserCheck size={14}/> {selectedResident.staffName}</p>
+                </div>
+                {selectedResident.isExited && (
+                  <div className="bg-gray-50 p-4 rounded-2xl border border-gray-200">
+                    <p className="text-gray-400 font-black mb-1 uppercase tracking-tighter">返却担当</p>
+                    <p className="font-bold text-gray-800 flex items-center gap-1.5"><RotateCcw size={14}/> {selectedResident.returnStaffName}</p>
+                    <p className="text-[9px] text-gray-400 mt-1.5 font-medium">{selectedResident.exitProcessedAt?.toDate?.()?.toLocaleString()}</p>
+                  </div>
+                )}
+              </div>
+
+              {/* 預かり物一覧 */}
+              <div className="space-y-4 mb-10">
+                <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-1">預かり品 明細</h4>
+                <div className="bg-gray-50 rounded-3xl p-6 space-y-3 shadow-inner border border-gray-100">
+                  {Object.entries(selectedResident.itemCounts || {}).map(([k, v]) => v > 0 && (
+                    <div key={k} className="bg-white p-3.5 rounded-xl flex justify-between items-center text-[13px] font-bold border shadow-sm">
+                      <span className="text-gray-600">{k}</span> <span className="text-blue-600">{v}枚</span>
+                    </div>
+                  ))}
+                  {Object.entries(selectedResident.itemChecks || {}).map(([k, v]) => v && (
+                    <div key={k} className="bg-white p-3.5 rounded-xl flex justify-between items-center text-[13px] font-bold border shadow-sm">
+                      <span className="text-gray-600">{k}</span> <CheckCircle2 className="text-emerald-500" size={18}/>
+                    </div>
+                  ))}
+
+                  {/* 現金明細 */}
+                  <div className="bg-gray-900 text-white p-5 rounded-2xl shadow-lg mt-4">
+                    <p className="text-[9px] font-black text-blue-400 mb-4 border-b border-white/10 pb-2 uppercase tracking-widest">Cash Details</p>
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-2 mb-4">
+                      {Object.entries(selectedResident.cashCounts || {}).map(([m, c]) => c > 0 && (
+                        <div key={m} className="text-[11px] font-bold text-gray-400 flex justify-between">
+                          <span>{parseInt(m).toLocaleString()}円</span>
+                          <span className="text-white">{c}枚</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex justify-between items-end border-t border-white/10 pt-4">
+                      <span className="text-[10px] font-black text-gray-500">合計</span>
+                      <span className="text-2xl font-black text-blue-400">¥{calculateTotalCash(selectedResident.cashCounts).toLocaleString()}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {!selectedResident.isExited ? (
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-xs font-black text-gray-400 ml-1">返却対応した職員 (必須)</label>
+                    <input type="text" className="w-full p-4 bg-gray-50 rounded-2xl border-2 border-transparent focus:border-blue-600 outline-none font-bold text-lg" placeholder="氏名を入力" value={returnStaff} onChange={e => setReturnStaff(e.target.value)} />
+                  </div>
+                  <div className="flex gap-3">
+                    <button onClick={() => setSelectedResident(null)} className="flex-1 py-5 rounded-2xl bg-gray-100 text-gray-400 font-bold">閉じる</button>
+                    <button onClick={() => { if (!returnStaff) return; handleExit(selectedResident.id); }} disabled={!returnStaff} className={`flex-[2] py-5 rounded-2xl font-black text-white shadow-xl transition-all ${returnStaff ? 'bg-blue-600 active:scale-95' : 'bg-gray-200 text-gray-400'}`}>返却を完了する</button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  <button onClick={() => handleRestore(selectedResident.id)} className="w-full py-5 rounded-2xl bg-gray-900 text-white font-black flex items-center justify-center gap-3 shadow-xl active:scale-95 transition-all">
+                    <RotateCcw size={20}/> 利用中に戻す
+                  </button>
+                  <button onClick={() => setSelectedResident(null)} className="w-full py-5 rounded-2xl bg-gray-100 text-gray-400 font-bold">閉じる</button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* 削除確認 */}
+        {confirmDeleteTarget && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[120] flex items-center justify-center p-8">
+            <div className="bg-white w-full max-w-xs rounded-[32px] p-8 text-center shadow-2xl animate-in zoom-in-95">
+              <div className="w-16 h-16 bg-red-50 text-red-500 rounded-full flex items-center justify-center mx-auto mb-6"><AlertTriangle size={32}/></div>
+              <h3 className="text-xl font-black text-gray-900 mb-2">完全に削除しますか？</h3>
+              <p className="text-xs text-gray-400 leading-relaxed font-medium">「{confirmDeleteTarget.name} 様」の全データを削除します。この操作は取り消せません。</p>
+              <div className="flex flex-col gap-3 pt-8">
+                <button onClick={() => handleDelete(confirmDeleteTarget.id)} className="w-full py-4 bg-red-500 text-white font-black rounded-2xl shadow-lg shadow-red-200">削除する</button>
+                <button onClick={() => setConfirmDeleteTarget(null)} className="w-full py-4 bg-gray-50 text-gray-400 font-bold rounded-2xl">キャンセル</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 期間指定一括削除 */}
+        {showBatchDeleteModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[110] flex items-center justify-center p-6">
+            <div className="bg-white w-full max-w-sm rounded-[40px] p-8 space-y-6 animate-in zoom-in-95 shadow-2xl border">
+              <h3 className="text-xl font-black text-gray-900 flex items-center gap-2 italic underline decoration-blue-500 underline-offset-8">退居データの一括操作</h3>
+              <div className="space-y-4 pt-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 ml-1 uppercase tracking-widest">退居日：開始</label>
+                  <input type="date" className="w-full p-4 bg-gray-50 rounded-2xl font-bold border-2 border-transparent focus:border-blue-500 outline-none" value={deleteStartDate} onChange={e => setDeleteStartDate(e.target.value)} />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-gray-400 ml-1 uppercase tracking-widest">退居日：終了</label>
+                  <input type="date" className="w-full p-4 bg-gray-50 rounded-2xl font-bold border-2 border-transparent focus:border-blue-500 outline-none" value={deleteEndDate} onChange={e => setDeleteEndDate(e.target.value)} />
+                </div>
+              </div>
+              <div className="flex flex-col gap-3 pt-4">
+                <button onClick={() => setShowBatchDeleteModal(false)} className="w-full py-4.5 bg-blue-600 text-white font-black rounded-2xl shadow-xl active:scale-95 transition-all">この期間を表示する</button>
+                <button onClick={handleBatchDelete} disabled={!deleteStartDate || !deleteEndDate} className={`w-full py-4.5 font-bold rounded-2xl border-2 transition-all ${deleteStartDate && deleteEndDate ? 'bg-red-50 text-red-500 border-red-100' : 'bg-gray-50 text-gray-200 border-transparent'}`}>期間内のデータを全削除</button>
+                <button onClick={() => { setShowBatchDeleteModal(false); setDeleteStartDate(''); setDeleteEndDate(''); }} className="w-full py-3 text-gray-300 font-bold">リセット</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  async function handleExit(id) {
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, id), {
+        isExited: true,
+        returnStaffName: returnStaff,
+        exitProcessedAt: serverTimestamp()
+      });
+      setSelectedResident(null);
+      setReturnStaff('');
+      setView('exited');
+    } catch (err) { alert("エラーが発生しました。"); }
+  }
+
+  async function handleRestore(id) {
+    try {
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, id), {
+        isExited: false,
+        returnStaffName: null,
+        exitProcessedAt: null
+      });
+      setSelectedResident(null);
+      setView('current');
+    } catch (err) { alert("エラーが発生しました。"); }
+  }
+
+  async function handleDelete(id) {
+    try {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', COLLECTION_NAME, id));
+      setConfirmDeleteTarget(null);
+      setSelectedResident(null);
+    } catch (err) { alert("エラーが発生しました。"); }
+  }
+}
